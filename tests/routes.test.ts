@@ -1,0 +1,130 @@
+/**
+ * The product surface: what the service advertises about itself and what it
+ * does with the traffic it receives.
+ */
+import { describe, test } from "node:test";
+import assert from "node:assert/strict";
+import { harness, route } from "./support/harness.js";
+
+describe("GET /", () => {
+  test("describes the service, its chain, and its menu", async () => {
+    const h = harness();
+    const response = await h.request("/");
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") ?? "", /application\/json/);
+
+    const body = (await response.json()) as {
+      service: string;
+      chain: { network: string; asset: string };
+      payTo: string;
+      endpoints: Array<{ path: string; price: string }>;
+      protocol: string;
+    };
+
+    assert.equal(body.service, "nimbus402");
+    assert.equal(body.chain.network, "eip155:2366");
+    assert.equal(body.chain.asset, "USDC.e");
+    assert.equal(body.payTo, h.env.payTo);
+    assert.equal(body.endpoints.length, 3);
+    assert.deepEqual(
+      body.endpoints.map((endpoint) => endpoint.path),
+      ["/v1/forecast", "/v1/air-quality", "/v1/climate"],
+    );
+    assert.equal(body.endpoints[0]?.price, "0.002 USDC.e");
+    assert.match(body.protocol, /x402/);
+  });
+});
+
+describe("GET /catalog", () => {
+  test("is a machine-readable price list, including the settlement token", async () => {
+    const h = harness({ PRICE_AIR_QUALITY: "0.0009" });
+    const body = (await (await h.request("/catalog")).json()) as {
+      generatedAt: string;
+      chain: string;
+      asset: { address: string; symbol: string; decimals: number; domain: { name: string; version: string } };
+      routes: Array<{ id: string; path: string; price: string; required: string[]; allowed: string[]; cachedForSeconds: number }>;
+    };
+
+    assert.equal(body.chain, "eip155:2366");
+    assert.equal(body.asset.symbol, "USDC.e");
+    assert.equal(body.asset.decimals, 6);
+    assert.deepEqual(body.asset.domain, { name: "Bridged USDC (Kite AI)", version: "2" });
+    assert.ok(!Number.isNaN(Date.parse(body.generatedAt)));
+
+    const air = body.routes.find((entry) => entry.id === "air-quality");
+    assert.equal(air?.price, "0.0009");
+    assert.deepEqual(air?.required, ["latitude", "longitude"]);
+    assert.ok(air?.allowed.includes("hourly"));
+    assert.equal(air?.cachedForSeconds, 45);
+
+    const climate = body.routes.find((entry) => entry.id === "climate");
+    assert.deepEqual(climate?.required, route("climate").requiredParams);
+  });
+});
+
+describe("GET /healthz", () => {
+  test("is free, greppable, and reports usage per route", async () => {
+    const h = harness();
+    const empty = (await (await h.request("/healthz")).json()) as {
+      ok: boolean;
+      network: string;
+      uptimeSeconds: number;
+      totalSettled: number;
+    };
+    assert.equal(empty.ok, true);
+    assert.equal(empty.network, "eip155:2366");
+    assert.equal(empty.totalSettled, 0);
+    assert.ok(empty.uptimeSeconds >= 0);
+
+    await h.paid("/v1/forecast?latitude=1&longitude=2");
+    await h.paid("/v1/climate?latitude=1&longitude=2&start_date=2026-01-01&end_date=2026-01-02");
+
+    const after = (await (await h.request("/healthz")).json()) as {
+      totalSettled: number;
+      uniquePayers: number;
+      routes: Record<string, { fetched: number; settled: number; collected: string }>;
+    };
+    assert.equal(after.totalSettled, 2);
+    assert.equal(after.uniquePayers, 1);
+    assert.equal(after.routes.forecast?.collected, "2000");
+    assert.equal(after.routes.climate?.collected, "10000");
+  });
+});
+
+describe("cache configuration", () => {
+  test("CACHE_TTL_SECONDS=0 turns caching off entirely", async () => {
+    const h = harness({ CACHE_TTL_SECONDS: "0" });
+    await h.paid("/v1/forecast?latitude=1&longitude=2");
+    const second = await h.paid("/v1/forecast?latitude=1&longitude=2");
+
+    assert.equal(second.headers.get("X-Nimbus-Cache"), "miss");
+    assert.equal(h.upstream.calls.length, 2);
+  });
+});
+
+describe("route table", () => {
+  test("every paid route has a unique path, price, and upstream host", async () => {
+    const h = harness();
+    const body = (await (await h.request("/catalog")).json()) as {
+      routes: Array<{ id: string; path: string; price: string }>;
+    };
+    const paths = body.routes.map((entry) => entry.path);
+    const ids = body.routes.map((entry) => entry.id);
+    assert.equal(new Set(paths).size, paths.length, "duplicate route path");
+    assert.equal(new Set(ids).size, ids.length, "duplicate route id");
+    for (const entry of body.routes) {
+      assert.match(entry.path, /^\/v1\//);
+      assert.ok(Number(entry.price) > 0, `${entry.id} has no positive price`);
+    }
+  });
+
+  test("the climate route is priced above a forecast, as its upstream cost dictates", async () => {
+    const h = harness();
+    const body = (await (await h.request("/catalog")).json()) as {
+      routes: Array<{ id: string; price: string }>;
+    };
+    const forecast = Number(body.routes.find((entry) => entry.id === "forecast")?.price);
+    const climate = Number(body.routes.find((entry) => entry.id === "climate")?.price);
+    assert.ok(climate > forecast, "archive queries cost more upstream than a forecast");
+  });
+});

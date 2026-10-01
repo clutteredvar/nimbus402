@@ -1,5 +1,5 @@
 /**
- * The product: three weather endpoints, each with its own price.
+ * The product: five weather endpoints, each with its own price.
  *
  * This is not a transparent proxy. Each route pins one upstream host and one
  * upstream path, forwards only an allow-listed set of query parameters, and
@@ -7,6 +7,7 @@
  * "whatever open-meteo felt like returning", and an unknown query parameter
  * cannot be used to probe the upstream for free.
  */
+import { createHash } from "node:crypto";
 import type { Context } from "hono";
 import type { TtlCache } from "../support/cache.js";
 import { log } from "../support/log.js";
@@ -83,6 +84,38 @@ export const DATA_ROUTES: readonly DataRoute[] = [
     requiredParams: ["latitude", "longitude", "start_date", "end_date"],
     example: "/v1/climate?latitude=40.71&longitude=-74.01&start_date=2026-01-01&end_date=2026-01-07&daily=temperature_2m_max",
   },
+  {
+    id: "marine",
+    path: "/v1/marine",
+    summary: "Wave height, swell, and sea surface conditions for a coordinate",
+    upstreamBase: "https://marine-api.open-meteo.com",
+    upstreamPath: "/v1/marine",
+    defaultPrice: "0.002",
+    allowedParams: [
+      "latitude",
+      "longitude",
+      "current",
+      "hourly",
+      "daily",
+      "timezone",
+      "forecast_days",
+      "past_days",
+      "cell_selection",
+    ],
+    requiredParams: ["latitude", "longitude"],
+    example: "/v1/marine?latitude=54.09&longitude=13.38&hourly=wave_height",
+  },
+  {
+    id: "geocode",
+    path: "/v1/geocode",
+    summary: "City or place name to coordinates — the lookup most weather calls need first",
+    upstreamBase: "https://geocoding-api.open-meteo.com",
+    upstreamPath: "/v1/search",
+    defaultPrice: "0.0005",
+    allowedParams: ["name", "count", "language", "format"],
+    requiredParams: ["name"],
+    example: "/v1/geocode?name=Berlin&count=1",
+  },
 ];
 
 /** Route id -> default price, for the env loader. */
@@ -148,9 +181,19 @@ export function createDataHandler(route: DataRoute, deps: DataHandlerDeps) {
     if (hit) {
       deps.meter.recordCacheHit(route.id);
       log.debug("cache_hit", { route: route.id, age: hit.ageSeconds });
+      const etag = etagOf(hit.body);
+      // Conditional request: the caller already has these bytes. A 304 is
+      // still a settled call — the price is per request, not per byte — but
+      // the body doesn't cross the wire again. Polling agents love this.
+      if (requestMatches(c.req.header("If-None-Match"), etag)) {
+        return new Response(null, {
+          status: 304,
+          headers: responseHeaders(route, { cached: true, age: hit.ageSeconds, etag }),
+        });
+      }
       return new Response(hit.body, {
         status: 200,
-        headers: responseHeaders(route, { cached: true, age: hit.ageSeconds, contentType: hit.contentType }),
+        headers: responseHeaders(route, { cached: true, age: hit.ageSeconds, contentType: hit.contentType, etag }),
       });
     }
 
@@ -187,21 +230,36 @@ export function createDataHandler(route: DataRoute, deps: DataHandlerDeps) {
 
     return new Response(body, {
       status: 200,
-      headers: responseHeaders(route, { cached: false, contentType }),
+      headers: responseHeaders(route, { cached: false, contentType, etag: etagOf(body) }),
     });
   };
 }
 
+/** Strong ETag: the first half of the body's sha256. Same bytes, same tag. */
+function etagOf(body: string): string {
+  return `"${createHash("sha256").update(body).digest("hex").slice(0, 32)}"`;
+}
+
+/** RFC 9110 If-None-Match comparison, simplified to what we actually emit. */
+function requestMatches(ifNoneMatch: string | undefined, etag: string): boolean {
+  if (!ifNoneMatch) return false;
+  return ifNoneMatch
+    .split(",")
+    .map((candidate) => candidate.trim())
+    .some((candidate) => candidate === etag || candidate === "*");
+}
+
 function responseHeaders(
   route: DataRoute,
-  options: { cached: boolean; contentType: string; age?: number },
+  options: { cached: boolean; contentType?: string; age?: number; etag: string },
 ): Record<string, string> {
   const headers: Record<string, string> = {
-    "Content-Type": options.contentType,
+    ETag: options.etag,
     "X-Nimbus-Route": route.id,
     "X-Nimbus-Cache": options.cached ? "hit" : "miss",
     "X-Nimbus-Upstream": new URL(route.upstreamBase).host,
   };
+  if (options.contentType) headers["Content-Type"] = options.contentType;
   if (options.age !== undefined) headers["X-Nimbus-Age"] = String(options.age);
   return headers;
 }

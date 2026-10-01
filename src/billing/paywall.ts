@@ -67,6 +67,9 @@ export interface PaywallOptions {
   onSettled?: (event: SettlementEvent) => void;
 }
 
+/** Statuses whose responses legally have no body at all (RFC 9110 §15.4.5). */
+const NULL_BODY_STATUSES = new Set([204, 205, 304]);
+
 function respond(c: Context, instructions: HTTPResponseInstructions): Response {
   const status = instructions.status as ContentfulStatusCode;
   const response = instructions.isHtml
@@ -264,7 +267,13 @@ export function paywallFrom(httpServer: HttpServer, options: PaywallOptions = {}
         }
         headers.set("Cache-Control", withPrivateCacheControl(headers.get("Cache-Control")));
         headers.delete(SETTLEMENT_OVERRIDES_HEADER);
-        c.res = new Response(body, { status: handlerResponse.status, headers });
+        // 204/205/304 are null-body statuses: the Response constructor refuses
+        // even an empty string there, and the re-read body below is "".
+        const nullBody = NULL_BODY_STATUSES.has(handlerResponse.status);
+        c.res = new Response(nullBody ? null : body, {
+          status: handlerResponse.status,
+          headers,
+        });
         return;
       }
     }

@@ -30,7 +30,7 @@ src/
     paywall.ts           # the 402 → verify → settle pipeline
     adapter.ts           # Hono → SDK HTTPRequestContext adapter
   routes/
-    weather.ts           # /v1/forecast, /v1/air-quality, /v1/climate
+    weather.ts           # /v1/forecast, /v1/air-quality, /v1/climate, /v1/marine, /v1/geocode
   support/
     cache.ts             # TTL cache for upstream responses
     meter.ts             # in-process usage counters
@@ -83,12 +83,21 @@ serve.
 
 | Route              | Default | Why that number                                   |
 | ------------------ | ------- | ------------------------------------------------- |
+| `/v1/geocode`      | $0.0005 | one name lookup, cached answers, tiny payload     |
 | `/v1/air-quality`  | $0.001  | one CAMS grid cell, single pollutant set          |
 | `/v1/forecast`     | $0.002  | one point, hourly, up to a week                   |
+| `/v1/marine`       | $0.002  | one point, wave/swell conditions                  |
 | `/v1/climate`      | $0.010  | reanalysis archive — the expensive one (~5 GB of source data) |
 
 The challenge always carries the price as raw atomic units in the
 `amount` field; the table above is the humanised display.
+
+Every data response carries a strong `ETag` (sha256 of the body). Send it
+back as `If-None-Match` on a repeat call and, when the answer hasn't
+changed, you get a `304` with no body — the bytes don't cross the wire
+twice. The call still settles; the price is per request, not per byte,
+which keeps the model honest for a service whose cache exists to protect
+the upstream, not to discount the caller.
 
 ## How billing actually works
 
@@ -130,7 +139,7 @@ verify/settle call order, which is how "verify happens before settle" and
 inspecting a real chain.
 
 ```
-npm test          # 48 tests
+npm test          # 56 tests
 npm run check     # tsc --noEmit
 ```
 

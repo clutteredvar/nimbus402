@@ -25,10 +25,10 @@ describe("GET /", () => {
     assert.equal(body.chain.network, "eip155:2366");
     assert.equal(body.chain.asset, "USDC.e");
     assert.equal(body.payTo, h.env.payTo);
-    assert.equal(body.endpoints.length, 3);
+    assert.equal(body.endpoints.length, 5);
     assert.deepEqual(
       body.endpoints.map((endpoint) => endpoint.path),
-      ["/v1/forecast", "/v1/air-quality", "/v1/climate"],
+      ["/v1/forecast", "/v1/air-quality", "/v1/climate", "/v1/marine", "/v1/geocode"],
     );
     assert.equal(body.endpoints[0]?.price, "0.002 USDC.e");
     assert.match(body.protocol, /x402/);
@@ -126,5 +126,100 @@ describe("route table", () => {
     const forecast = Number(body.routes.find((entry) => entry.id === "forecast")?.price);
     const climate = Number(body.routes.find((entry) => entry.id === "climate")?.price);
     assert.ok(climate > forecast, "archive queries cost more upstream than a forecast");
+  });
+});
+
+describe("the marine route", () => {
+  test("is paid, forwarded to the marine host, and priced like a forecast", async () => {
+    const h = harness();
+    const response = await h.paid("/v1/marine?latitude=54.09&longitude=13.38&hourly=wave_height");
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("X-Nimbus-Route"), "marine");
+    assert.equal(response.headers.get("X-Nimbus-Upstream"), "marine-api.open-meteo.com");
+    assert.equal(h.upstream.calls.length, 1);
+    assert.match(h.upstream.calls[0]?.url ?? "", /marine-api\.open-meteo\.com\/v1\/marine/);
+    assert.match(h.upstream.calls[0]?.url ?? "", /hourly=wave_height/);
+    assert.equal(h.facilitator.lastSettleRequirements?.amount, "2000", "0.002 USDC.e");
+  });
+
+  test("rejects a missing coordinate before billing", async () => {
+    const h = harness();
+    const response = await h.paid("/v1/marine?hourly=wave_height");
+    assert.equal(response.status, 400);
+    const body = (await response.json()) as { error: { code: string } };
+    assert.equal(body.error.code, "missing_params");
+  });
+});
+
+describe("the geocode route", () => {
+  test("turns a place name into coordinates, priced at the floor", async () => {
+    const h = harness();
+    const response = await h.paid("/v1/geocode?name=Berlin&count=1");
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("X-Nimbus-Upstream"), "geocoding-api.open-meteo.com");
+    assert.match(h.upstream.calls[0]?.url ?? "", /\/v1\/search\?/);
+    assert.match(h.upstream.calls[0]?.url ?? "", /name=Berlin/);
+    // 0.0005 USDC.e in atomic units.
+    assert.equal(h.facilitator.lastSettleRequirements?.amount, "500");
+  });
+
+  test("a call without a name is rejected before billing", async () => {
+    const h = harness();
+    const response = await h.paid("/v1/geocode?count=1");
+    assert.equal(response.status, 400);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    assert.equal(body.error.code, "missing_params");
+    assert.match(body.error.message, /name/);
+  });
+});
+
+describe("conditional requests", () => {
+  test("every 200 carries an ETag that is stable across identical calls", async () => {
+    const h = harness();
+    const first = await h.paid("/v1/forecast?latitude=52.52&longitude=13.41");
+    const etag = first.headers.get("ETag");
+    assert.ok(etag, "a data response must carry an ETag");
+
+    const second = await h.paid("/v1/forecast?latitude=52.52&longitude=13.41");
+    assert.equal(second.headers.get("ETag"), etag);
+  });
+
+  test("If-None-Match on a cached answer yields a 304 with no body", async () => {
+    const h = harness();
+    const first = await h.paid("/v1/forecast?latitude=52.52&longitude=13.41");
+    const etag = first.headers.get("ETag");
+    assert.ok(etag);
+
+    const revalidation = await h.paid("/v1/forecast?latitude=52.52&longitude=13.41", {
+      headers: { "If-None-Match": etag ?? "" },
+    });
+
+    assert.equal(revalidation.status, 304);
+    assert.equal(revalidation.headers.get("ETag"), etag);
+    assert.equal(revalidation.headers.get("X-Nimbus-Cache"), "hit");
+    assert.equal(await revalidation.text(), "", "a 304 carries no body");
+    // The revalidation still settled: the price is per request, not per byte.
+    assert.equal(h.facilitator.settleCount(), 2);
+  });
+
+  test("a stale If-None-Match gets the full body back", async () => {
+    const h = harness();
+    await h.paid("/v1/forecast?latitude=52.52&longitude=13.41");
+    const stale = await h.paid("/v1/forecast?latitude=52.52&longitude=13.41", {
+      headers: { "If-None-Match": '"00000000000000000000000000000000"' },
+    });
+    assert.equal(stale.status, 200);
+    assert.ok((await stale.text()).length > 0);
+  });
+
+  test("If-None-Match: * matches anything we could return", async () => {
+    const h = harness();
+    await h.paid("/v1/air-quality?latitude=48.85&longitude=2.35");
+    const anyTag = await h.paid("/v1/air-quality?latitude=48.85&longitude=2.35", {
+      headers: { "If-None-Match": "*" },
+    });
+    assert.equal(anyTag.status, 304);
   });
 });

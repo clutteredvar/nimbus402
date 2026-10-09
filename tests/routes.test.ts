@@ -223,3 +223,90 @@ describe("conditional requests", () => {
     assert.equal(anyTag.status, 304);
   });
 });
+
+describe("upstream pressure", () => {
+  const FORECAST = "/v1/forecast?latitude=52.52&longitude=13.41&hourly=temperature_2m";
+
+  test("identical calls arriving together share one upstream call", async () => {
+    const h = harness();
+    // A provider slow enough that all five callers are in flight at once —
+    // which is exactly the burst this is supposed to absorb.
+    h.upstream.state.delayMs = 60;
+
+    const responses = await Promise.all(Array.from({ length: 5 }, () => h.paid(FORECAST)));
+
+    for (const response of responses) assert.equal(response.status, 200);
+    assert.equal(h.upstream.calls.length, 1, "five callers, one open-meteo call");
+    const usage = h.meter.snapshot().routes.forecast;
+    assert.equal(usage?.fetched, 1);
+    assert.equal(usage?.coalesced, 4, "the other four rode along");
+    // Coalescing must not become a discount: every caller still settles.
+    assert.equal(h.facilitator.settleCount(), 5);
+  });
+
+  test("different coordinates are still different upstream calls", async () => {
+    const h = harness();
+    h.upstream.state.delayMs = 40;
+    await Promise.all([
+      h.paid("/v1/forecast?latitude=1&longitude=2"),
+      h.paid("/v1/forecast?latitude=3&longitude=4"),
+    ]);
+    assert.equal(h.upstream.calls.length, 2);
+  });
+
+  test("a slow upstream is told apart from a broken one once an entry exists", async () => {
+    const h = harness({ CACHE_TTL_SECONDS: "1", CACHE_STALE_SECONDS: "60" });
+    const first = await h.paid(FORECAST);
+    assert.equal(first.headers.get("X-Nimbus-Cache"), "miss");
+    const original = await first.text();
+
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+
+    // Past the TTL, so this is a stale serve: the answer exists, it is old,
+    // and the refresh runs behind the caller instead of in front of them.
+    const stale = await h.paid(FORECAST);
+    assert.equal(stale.status, 200);
+    assert.equal(stale.headers.get("X-Nimbus-Cache"), "stale");
+    assert.equal(await stale.text(), original);
+    assert.ok(Number(stale.headers.get("X-Nimbus-Age")) >= 1);
+    assert.equal(h.meter.snapshot().routes.forecast?.stale, 1);
+
+    // Let the background refresh land, then the entry is fresh again.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(h.upstream.calls.length, 2, "one refresh, behind the caller");
+    const fresh = await h.paid(FORECAST);
+    assert.equal(fresh.headers.get("X-Nimbus-Cache"), "hit");
+  });
+
+  test("a stale entry keeps answering while the upstream is down", async () => {
+    const h = harness({ CACHE_TTL_SECONDS: "1", CACHE_STALE_SECONDS: "60" });
+    const first = await h.paid(FORECAST);
+    const original = await first.text();
+
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    h.upstream.state.unreachable = true;
+
+    const stale = await h.paid(FORECAST);
+    // Not a 502: a two-minute-old forecast beats an error, and the caller
+    // is told which one they got. The failed refresh leaves the entry alone.
+    assert.equal(stale.status, 200);
+    assert.equal(stale.headers.get("X-Nimbus-Cache"), "stale");
+    assert.equal(await stale.text(), original);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const again = await h.paid(FORECAST);
+    assert.equal(again.status, 200);
+    assert.equal(again.headers.get("X-Nimbus-Cache"), "stale");
+  });
+
+  test("CACHE_STALE_SECONDS=0 means an expired entry is simply gone", async () => {
+    const h = harness({ CACHE_TTL_SECONDS: "1", CACHE_STALE_SECONDS: "0" });
+    await h.paid(FORECAST);
+
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+
+    const after = await h.paid(FORECAST);
+    assert.equal(after.headers.get("X-Nimbus-Cache"), "miss");
+    assert.equal(h.upstream.calls.length, 2);
+  });
+});

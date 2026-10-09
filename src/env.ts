@@ -15,6 +15,8 @@ export interface ServiceEnv {
   readonly facilitatorUrl: string;
   readonly port: number;
   readonly cacheTtlSeconds: number;
+  /** Seconds past the TTL that an entry may still be served while it refreshes. */
+  readonly cacheStaleSeconds: number;
   readonly upstreamTimeoutMs: number;
   /** route id -> USD price string, e.g. { forecast: "0.002" } */
   readonly prices: Readonly<Record<string, string>>;
@@ -89,6 +91,7 @@ export function loadEnv(
     facilitatorUrl,
     port: readInt(source, "PORT", 8787, 1),
     cacheTtlSeconds: readInt(source, "CACHE_TTL_SECONDS", 45, 0),
+    cacheStaleSeconds: readInt(source, "CACHE_STALE_SECONDS", 120, 0),
     upstreamTimeoutMs: readInt(source, "UPSTREAM_TIMEOUT_MS", 4000, 100),
     prices,
   };

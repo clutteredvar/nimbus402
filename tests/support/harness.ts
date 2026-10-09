@@ -101,7 +101,7 @@ export interface UpstreamCall {
 
 export function stubUpstream() {
   const calls: UpstreamCall[] = [];
-  const state = { status: 200, unreachable: false, body: null as string | null };
+  const state = { status: 200, unreachable: false, body: null as string | null, delayMs: 0 };
 
   const fetchImpl = (async (input: string | URL, init?: RequestInit) => {
     const url = input instanceof URL ? input.toString() : String(input);
@@ -110,6 +110,9 @@ export function stubUpstream() {
       headers[name] = value;
     });
     calls.push({ url, method: init?.method ?? "GET", headers });
+    // A slow provider is the reason coalescing and the stale window exist, so
+    // tests need to be able to make one.
+    if (state.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, state.delayMs));
     if (state.unreachable) throw new Error("ECONNRESET (simulated)");
     const payload = state.body ?? JSON.stringify({ upstream: "open-meteo", url });
     return new Response(payload, {

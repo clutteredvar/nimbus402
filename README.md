@@ -32,7 +32,8 @@ src/
   routes/
     weather.ts           # /v1/forecast, /v1/air-quality, /v1/climate, /v1/marine, /v1/geocode
   support/
-    cache.ts             # TTL cache for upstream responses
+    cache.ts             # TTL cache for upstream responses, with a stale window
+    singleflight.ts      # coalesces identical upstream calls that overlap
     meter.ts             # in-process usage counters
     log.ts               # structured one-line logs
 tests/                   # node:test, no third-party runner
@@ -73,6 +74,8 @@ See `.env.example` for the full set. The interesting ones:
 - `CACHE_TTL_SECONDS` — how long an identical upstream response is reused,
   so a burst of requests for the same city doesn't hammer the free
   upstream quota.
+- `CACHE_STALE_SECONDS` — how long past the TTL an entry may still be
+  served while it refreshes behind the caller. `0` turns it off.
 
 ## Pricing
 
@@ -98,6 +101,32 @@ changed, you get a `304` with no body — the bytes don't cross the wire
 twice. The call still settles; the price is per request, not per byte,
 which keeps the model honest for a service whose cache exists to protect
 the upstream, not to discount the caller.
+
+## Upstream pressure
+
+The upstreams here rate-limit by IP, and this service is one IP, so the two
+ways to lose the service are a burst and a slow day. Both are handled
+before they reach the provider:
+
+**Identical calls that overlap in time become one upstream call.** A famous
+location at 6am can draw a dozen callers in the same second, all asking for
+the same grid cell; `src/support/singleflight.ts` lets the first one do the
+work and hands everyone who arrives while it is still running the same
+promise. This is not a discount — each of those callers still goes through
+`verify → settle` and pays the same price — it is what keeps the free
+upstream quota from being spent twelve times for one answer.
+
+**An expired entry is served while it refreshes.** With
+`CACHE_STALE_SECONDS` set, an entry past its TTL is still handed out, and
+the refresh runs *behind* the caller instead of in front of them. If the
+refresh succeeds the entry becomes fresh again; if it fails — provider
+down, timeout — the old entry simply stays in place and keeps serving until
+it ages out of the window. A caller would rather have a two-minute-old
+forecast than a 502, and the response says which one they got:
+`X-Nimbus-Cache: miss | hit | stale`.
+
+Nothing about this changes who pays: the freshness of the body is a
+property of the cache, the price is a property of the request.
 
 ## How billing actually works
 
@@ -127,8 +156,11 @@ creeps in:
   **502**, again below the payer. A flaky provider doesn't become a
   revenue source.
 
-The meter at `/healthz` counts `fetched`, `cached`, `settled`, and total
-`collected` atomic units, broken out per route.
+The meter at `/healthz` counts `fetched`, `cached`, `stale`, `coalesced`,
+`settled`, and total `collected` atomic units, broken out per route.
+`fetched` counts upstream calls rather than callers, so a coalesced burst
+shows up as one fetch and four coalesces — which is the number you want
+when you are watching the upstream quota.
 
 ## Tests
 
@@ -139,7 +171,7 @@ verify/settle call order, which is how "verify happens before settle" and
 inspecting a real chain.
 
 ```
-npm test          # 56 tests
+npm test          # 61 tests
 npm run check     # tsc --noEmit
 ```
 

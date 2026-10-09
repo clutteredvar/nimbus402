@@ -13,10 +13,11 @@ import { x402ResourceServer } from "@x402/core/server";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { SETTLEMENT_CHAINS, formatPrice, kiteMoneyParser, type SettlementChain } from "./billing/chains.js";
 import { paywall } from "./billing/paywall.js";
-import { DATA_ROUTES, createDataHandler, priceDefaults, routeIdForPath } from "./routes/weather.js";
+import { DATA_ROUTES, createDataHandler, priceDefaults, routeIdForPath, type FetchOutcome } from "./routes/weather.js";
 import { TtlCache } from "./support/cache.js";
 import { log } from "./support/log.js";
 import { UsageMeter } from "./support/meter.js";
+import { SingleFlight } from "./support/singleflight.js";
 import type { ServiceEnv } from "./env.js";
 
 export interface AppDeps {
@@ -63,7 +64,8 @@ export function buildApp(deps: AppDeps): BuiltApp {
   const { env } = deps;
   const chain = SETTLEMENT_CHAINS[env.networkKey];
   const meter = deps.meter ?? new UsageMeter();
-  const cache = deps.cache ?? new TtlCache(env.cacheTtlSeconds);
+  const cache = deps.cache ?? new TtlCache(env.cacheTtlSeconds, 500, env.cacheStaleSeconds);
+  const flights = new SingleFlight<FetchOutcome>();
   const facilitator = deps.facilitator ?? new HTTPFacilitatorClient({ url: env.facilitatorUrl });
   const fetchImpl = deps.fetchImpl ?? fetch;
 
@@ -111,6 +113,7 @@ export function buildApp(deps: AppDeps): BuiltApp {
         required: route.requiredParams,
         allowed: route.allowedParams,
         cachedForSeconds: env.cacheTtlSeconds,
+        staleForSeconds: env.cacheStaleSeconds,
       })),
     }),
   );
@@ -132,7 +135,10 @@ export function buildApp(deps: AppDeps): BuiltApp {
   );
 
   for (const route of DATA_ROUTES) {
-    app.get(route.path, createDataHandler(route, { cache, meter, fetchImpl, timeoutMs: env.upstreamTimeoutMs }));
+    app.get(
+      route.path,
+      createDataHandler(route, { cache, meter, fetchImpl, flights, timeoutMs: env.upstreamTimeoutMs }),
+    );
   }
 
   return { app, meter, cache };

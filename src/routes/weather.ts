@@ -12,6 +12,7 @@ import type { Context } from "hono";
 import type { TtlCache } from "../support/cache.js";
 import { log } from "../support/log.js";
 import type { UsageMeter } from "../support/meter.js";
+import type { SingleFlight } from "../support/singleflight.js";
 
 export interface DataRoute {
   /** Short id. Also the env suffix for the price override: PRICE_<ID>. */
@@ -141,13 +142,71 @@ export interface DataHandlerDeps {
   readonly meter: UsageMeter;
   readonly fetchImpl: typeof fetch;
   readonly timeoutMs: number;
+  /** Coalesces identical upstream calls that overlap in time. */
+  readonly flights: SingleFlight<FetchOutcome>;
   /** Injectable for tests: defaults to AbortSignal.timeout. */
   readonly timeoutSignal?: (ms: number) => AbortSignal;
 }
 
+/** One upstream attempt, normalised so the caller path has a single branch. */
+export type FetchOutcome =
+  | { readonly kind: "ok"; readonly body: string; readonly contentType: string }
+  | { readonly kind: "unreachable"; readonly detail: string }
+  | { readonly kind: "error"; readonly status: number };
+
 /** Build the request handler for one route. */
 export function createDataHandler(route: DataRoute, deps: DataHandlerDeps) {
   const timeout = deps.timeoutSignal ?? ((ms: number) => AbortSignal.timeout(ms));
+
+  const fetchUpstream = async (upstream: URL): Promise<FetchOutcome> => {
+    let upstreamResponse: Response;
+    try {
+      upstreamResponse = await deps.fetchImpl(upstream, {
+        method: "GET",
+        headers: { Accept: "application/json", "User-Agent": "nimbus402/0.2 (+weather)" },
+        redirect: "manual",
+        signal: timeout(deps.timeoutMs),
+      });
+    } catch (error) {
+      log.warn("upstream_unreachable", { route: route.id, detail: String(error) });
+      return { kind: "unreachable", detail: String(error) };
+    }
+
+    const body = await upstreamResponse.text();
+    if (!upstreamResponse.ok) {
+      log.warn("upstream_error", { route: route.id, status: upstreamResponse.status });
+      return { kind: "error", status: upstreamResponse.status };
+    }
+    return {
+      kind: "ok",
+      body,
+      contentType: upstreamResponse.headers.get("Content-Type") ?? "application/json",
+    };
+  };
+
+  /**
+   * Refresh an entry whose TTL has run out. Deliberately not awaited: the
+   * caller already has an answer, and blocking on open-meteo to serve a stale
+   * response defeats the point of having one.
+   */
+  const refreshBehind = (cacheKey: string, upstream: URL): void => {
+    void deps.flights
+      .run(cacheKey, () => fetchUpstream(upstream), () => deps.meter.recordCoalesced(route.id))
+      .then((outcome) => {
+        if (outcome.kind === "ok") {
+          deps.cache.put(cacheKey, outcome.body, outcome.contentType);
+          deps.meter.recordFetch(route.id);
+          log.debug("stale_refreshed", { route: route.id });
+          return;
+        }
+        // The stale entry stays in place and keeps serving until the refresh
+        // succeeds or the entry ages out of the window entirely.
+        log.warn("stale_refresh_failed", { route: route.id, reason: outcome.kind });
+      })
+      .catch((error: unknown) => {
+        log.warn("stale_refresh_failed", { route: route.id, reason: String(error) });
+      });
+  };
 
   return async (c: Context): Promise<Response> => {
     const incoming = new URL(c.req.url);
@@ -188,49 +247,84 @@ export function createDataHandler(route: DataRoute, deps: DataHandlerDeps) {
       if (requestMatches(c.req.header("If-None-Match"), etag)) {
         return new Response(null, {
           status: 304,
-          headers: responseHeaders(route, { cached: true, age: hit.ageSeconds, etag }),
+          headers: responseHeaders(route, { state: "hit", age: hit.ageSeconds, etag }),
         });
       }
       return new Response(hit.body, {
         status: 200,
-        headers: responseHeaders(route, { cached: true, age: hit.ageSeconds, contentType: hit.contentType, etag }),
+        headers: responseHeaders(route, {
+          state: "hit",
+          age: hit.ageSeconds,
+          contentType: hit.contentType,
+          etag,
+        }),
       });
     }
 
-    let upstreamResponse: Response;
-    try {
-      upstreamResponse = await deps.fetchImpl(upstream, {
-        method: "GET",
-        headers: { Accept: "application/json", "User-Agent": "nimbus402/0.2 (+weather)" },
-        redirect: "manual",
-        signal: timeout(deps.timeoutMs),
+    // Past the TTL but inside the stale window: answer now, refresh behind.
+    // The upstream being slow must not turn into a 502 for a caller who would
+    // have accepted a two-minute-old forecast.
+    const stale = deps.cache.getStale(cacheKey);
+    if (stale) {
+      deps.meter.recordStaleServed(route.id);
+      refreshBehind(cacheKey, upstream);
+      const etag = etagOf(stale.body);
+      log.debug("cache_stale", { route: route.id, age: stale.ageSeconds });
+      if (requestMatches(c.req.header("If-None-Match"), etag)) {
+        return new Response(null, {
+          status: 304,
+          headers: responseHeaders(route, { state: "stale", age: stale.ageSeconds, etag }),
+        });
+      }
+      return new Response(stale.body, {
+        status: 200,
+        headers: responseHeaders(route, {
+          state: "stale",
+          age: stale.ageSeconds,
+          contentType: stale.contentType,
+          etag,
+        }),
       });
-    } catch (error) {
+    }
+
+    // Miss. Coalesced: a burst of identical calls turns into one open-meteo
+    // call, which is what keeps this service inside the upstream's IP quota.
+    // `fetched` counts upstream calls, not callers, so only the caller that
+    // actually started the run records one; the rest record a coalesce.
+    let rodeAlong = false;
+    const outcome = await deps.flights.run(
+      cacheKey,
+      () => fetchUpstream(upstream),
+      () => {
+        rodeAlong = true;
+        deps.meter.recordCoalesced(route.id);
+      },
+    );
+
+    if (outcome.kind === "unreachable") {
       // 502 >= 400, so the caller pays nothing for an upstream that is down.
-      log.warn("upstream_unreachable", { route: route.id, detail: String(error) });
       return c.json(errorEnvelope("upstream_unreachable", "the data provider did not answer in time"), 502);
     }
-
-    const body = await upstreamResponse.text();
-
-    if (!upstreamResponse.ok) {
-      log.warn("upstream_error", { route: route.id, status: upstreamResponse.status });
+    if (outcome.kind === "error") {
       return c.json(
-        errorEnvelope("upstream_error", `data provider returned ${upstreamResponse.status}`, {
-          upstreamStatus: upstreamResponse.status,
+        errorEnvelope("upstream_error", `data provider returned ${outcome.status}`, {
+          upstreamStatus: outcome.status,
         }),
         502,
       );
     }
 
-    deps.meter.recordFetch(route.id);
-    const contentType = upstreamResponse.headers.get("Content-Type") ?? "application/json";
-    deps.cache.put(cacheKey, body, contentType);
+    if (!rodeAlong) deps.meter.recordFetch(route.id);
+    deps.cache.put(cacheKey, outcome.body, outcome.contentType);
     log.debug("upstream_fetch", { route: route.id, params: forwarded.length });
 
-    return new Response(body, {
+    return new Response(outcome.body, {
       status: 200,
-      headers: responseHeaders(route, { cached: false, contentType, etag: etagOf(body) }),
+      headers: responseHeaders(route, {
+        state: "miss",
+        contentType: outcome.contentType,
+        etag: etagOf(outcome.body),
+      }),
     });
   };
 }
@@ -249,14 +343,17 @@ function requestMatches(ifNoneMatch: string | undefined, etag: string): boolean 
     .some((candidate) => candidate === etag || candidate === "*");
 }
 
+/** How the body the caller is about to receive was obtained. */
+type CacheState = "miss" | "hit" | "stale";
+
 function responseHeaders(
   route: DataRoute,
-  options: { cached: boolean; contentType?: string; age?: number; etag: string },
+  options: { state: CacheState; contentType?: string; age?: number; etag: string },
 ): Record<string, string> {
   const headers: Record<string, string> = {
     ETag: options.etag,
     "X-Nimbus-Route": route.id,
-    "X-Nimbus-Cache": options.cached ? "hit" : "miss",
+    "X-Nimbus-Cache": options.state,
     "X-Nimbus-Upstream": new URL(route.upstreamBase).host,
   };
   if (options.contentType) headers["Content-Type"] = options.contentType;
